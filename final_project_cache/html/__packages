@@ -1,0 +1,10 @@
+base
+dplyr
+tidyr
+reshape2
+ggplot2
+corrplot
+lattice
+caret
+plyr
+Rmisc

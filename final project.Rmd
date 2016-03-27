@@ -1,0 +1,573 @@
+---
+title: "Practical Machine Learning - Final Project"
+author: "Jiddu Alexander"
+date: "March 2, 2016"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, fig.height=3.5, echo=TRUE, warning=FALSE, message=FALSE, results="show")
+options(scipen=999)
+```
+
+---------
+
+```{r load packages}
+library(dplyr)
+library(tidyr)
+library(reshape2)     # Melt function
+library(ggplot2)
+library(corrplot)     # Correlation plotting
+library(caret)
+library(Rmisc)        # Multiplot
+```
+
+# Strategy
+
+What is the question we want to answer and what route will we set out to answer that question.
+
+## Question to answer
+
+Six participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways. A dataset was created that includes the manner (5 different ways) that they did the exercise and data from measurement instruments.
+
+Can we predict the manner that they performed exercise from all the other variables in the dataset?
+
+And more specifically we have to create a report that
+
+- describes how we built our model, 
+- how we used cross validation, 
+- what we think the expected out of sample error is, 
+- why we made the choices we did.
+
+We will also use our prediction model to predict 20 different test cases.
+
+## Plan of attack
+
+We will examine and describe the data to choose appropriate models to apply to our models. We will start with simple models and apply cross validation to evaluate them. Then we apply tools to decide how to proceed based on the evaluation.
+
+Finally, we will optimise one model with cross validation and use it to predict out of sample error.
+
+The question 
+6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways.
+The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set.
+
+You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+# Data
+
+For this assignment we use the data for this project come from this source: http://groupware.les.inf.puc-rio.br/har
+
+We want to predict the variable 'classe' that predicts the manner in which they did the exercise. There are 5 different manners that do not have a linear structure, non mathematical (ie. one manner does not have double the value of another manner). Hence, we should treat this as a classification problem. The manners are describes as 
+> exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E)
+
+We may use any other variables in the dataset that includes data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. 
+
+image: ![](on-body-sensing-schema.png)
+
+Image source: http://groupware.les.inf.puc-rio.br/har
+
+Expect to see differences: 
+
+- class B in forearm z values, and dumbbell z values.
+- class C in forearm y values, and dumbbell y values.
+- class D in forearm y values, and dumbbell y values.
+- Class E in belt y and z direction
+
+Let's explore...
+
+## (down)Load data
+
+```{r load training data}
+if (!file.exists("pml-testing.csv")){
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  "pml-testing.csv")
+    }
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+## Data wrangling
+
+Even though the assignment allowed us to se all other variables, we don't really want to use them all. Some data wrangling is in order.
+
+### Subsetting preferred variables
+
+We can find 19622 observation for 160 variables in the training set. There are a large number of variables that only have data (not empty and not NA) when the new_window variable shows 'no' (a factor variable with yes and no).
+
+Also remove variable X, because it has almost perfect correlation with classe, but we can't expect that of any future set that we want to predict on. We will also the remove user name, the time stamp variables and num window because we want to create generalised predictions.
+
+We also want to randomly hustle the data already, because it is very ordered.
+
+```{r data cleaning training set}
+train_temp <- training[, colSums(is.na(training)) != 19216]
+complete_column <- sapply(train_temp, function(x) max(table(x)) != 19216)
+train_temp <- train_temp[,complete_column]
+train_temp <- train_temp[,-c(1:6)]
+train_set <- train_temp[sample(nrow(train_temp)),]
+```
+
+## Normalise data
+
+The variables all have widely varying ranges of values. To avoid skewed analysis we normalise all (numeric) variables. 
+
+```{r normalise}
+train <- train_set
+ind <- sapply(train, is.numeric)
+train[ind] <- sapply(train[ind], scale)
+```
+
+## Data visualisation
+
+Plot histograms to see how all the data are distributed. This will give us a sense of what we are dealing with and may influence our decision making when tackling the problem. Find here one plot with histograms for 4 variables, for the histograms of all other variables see appendix 1.1.
+
+```{r plot_hist_function}
+# data_hist is a function to plot histograms for a range of columns of a data frame
+data_hist <- function(cols){
+  random_sample <- sample_frac(train,0.1)
+  columns = cols
+  repititions = length(unique(columns))
+  d <- melt(random_sample[,columns])
+  d$y <- rep(random_sample$classe,repititions)
+  
+  g <- ggplot(d, aes(x=value, fill = y)) 
+  g <- g + facet_wrap(~variable, scales = "free_x") 
+  g <- g + geom_histogram()
+  g
+}
+```
+
+```{r plot_hist}
+data_hist(c(7:10))
+```
+
+As expected, we see that class E will be easily separated in the belt data. But to get high precision separation of all variables will require more sophistication than drawing straight lines through the histograms.
+
+## Corrplot
+
+To get a sense of how much all the variables are correlated and where the correlation are we can plot a corrplot. 
+
+```{r corrplot, fig.width = 9, fig.height = 9}
+corrplot(cor(train[,-53]), method = "circle")
+```
+
+Most correlations are within the single measurement instruments, but overal there is not a very high level of correlation.
+
+# Analytics
+
+The data set has a much greater number of samples than variables, we can choose a high performance model like random forest without worrying to much about over-fitting. It will form a good baseline to compare other models too.
+
+We will start by plotting learning curves (training and cross validation error versus number of samples used in the training set) for relatively low number of samples in the training set and then choose a next step.
+
+## Random Forest
+
+As mentioned, first we will try to create a model with fewer samples and plot the learning curve. This is to speed up the process and not perform unnecessary tasks.
+
+### Learning curve
+
+To evaluate and plot the learning curve I've used the r code in appendix 1.2. However, due to times needed for creating models and frequent R session breakdown I've saved a model from the console from which I will load the results into this report.
+
+```{r load_compare_models_df}
+compare_models_df <- readRDS("compare_models_df")
+compare_models_df$model_name <- as.factor(compare_models_df$model_name)
+compare_models_df_rf <- filter(compare_models_df, model_name =="rf")
+```
+
+```{r plot_learning_curve_rf}
+# learning curves
+g <- ggplot(data = compare_models_df_rf, aes(y=training_accuracy, x=number_of_training_samples, colour = model_name))
+g <- g + geom_line(linetype = 4, size = 1)
+g <- g + geom_line(aes(y=cv_accuracy, x= number_of_training_samples), linetype = 3, size = 1)
+g
+```
+
+The figure shows 100% accuracy in training set (dot-dashed line) for each number of samples trained with up to nearly 3000 samples (approx. 15% of the available training data), the cross validation accuracy (dotted line) is increasing with number of samples and reaches a very decent 96.7% accuracy.
+
+### Next steps
+
+The random forest model is looking promising. The learning curve shows low bias and high variance, meaning that it would be beneficial to train with more data. However, my not very powerful computer is taking a long time to model the computationally heavy random forest model (150 minutes for 2946 training samples), so let's explore a few other options:
+
+- Apply PCA to reduce variables and increase the speed and allow more training data
+- Switch to a less complex training model
+
+I will create learning curves for three models
+
+- random forest model after applying PCA, 
+- a boosting model
+- a simple tree model
+
+## Principal Component Analysis, PCA
+
+Use prcomp() to find the principal components.
+
+```{r}
+PCA_all <- prcomp(train[,1:52])
+summary(PCA_all)
+```
+
+The first 15 components have a cumulative proportion of variation over 85%, I consider this as sufficient because 100% of accuracy was reached without principal components with only a very small part of the data.
+
+```{r}
+# Use 15 PCA components
+train_PCA <- data.frame(PCA_all$x[,1:15])
+```
+
+### Learning curve for random forest with PCA
+
+I used the code in appendix 1.3 to generate a learning curve (as the code was run in the console originally and took a long time I won't repeat this operation in this markdown document, below follow the results)
+
+The results will be discussed in a later section together with the other models.
+
+## Boosting
+
+Another popular model is the boosting model and I will use a standard implementation on smaller subsets of training data to compare it to the performance of the random forest and other models.
+
+### Learning curve - Boosting
+
+See appendix 1.4 for the code to produce results. The results will be discussed in a later section.
+
+## Tree (rpart)
+
+Train with simple tree.
+
+### Learning curve - tree
+
+See appendix 1.5 for the code to produce results and the next section for the smmary of the results.
+
+## Compare models and choose final model
+
+Create data frame with learning curves and learning times for various models.
+
+```{r plot_model_comparison}
+compare_models_df_small <- compare_models_df %>% filter(number_of_training_samples < 7500) %>% filter(model_name != "rf_final")
+
+# learning curves
+g1 <- ggplot(data = compare_models_df_small, aes(y=training_accuracy, x=number_of_training_samples, colour = model_name))
+g1 <- g1 + geom_line(linetype = 4, size = 1)
+g1 <- g1 + geom_line(aes(y=cv_accuracy, x= number_of_training_samples), linetype = 3, size = 1)
+
+# learning times versus training samples
+g2 <- ggplot(data = compare_models_df_small, aes(y=minutes_to_train_model, x=number_of_training_samples, colour = model_name))
+g2 <- g2 + geom_line(linetype = 4, size = 1)
+
+# cross validation accuracy versus learning times
+g3 <- ggplot(data = compare_models_df_small, aes(y=cv_accuracy, x=minutes_to_train_model, colour = model_name))
+g3 <- g3 + geom_line(linetype = 4, size = 1)
+```
+
+```{r plots}
+g1
+g2
+g3
+```
+
+The most interesting plot when it comes to next step is cross validation accuracy versus learning times. It shows that random forest (rf) and boosting (b) have the highest accuracy per learning time. Even though the PCA random forest model takes significantly less time to train per number of samples. It could possibly be worth it to try a PCA model that retains a higher percentage of variation, but the time winnings for this PCA model are not spectacular and the cross validation accuracy of the random forest model is very high, hence I do not see the need.
+
+Unfortunately an error persisted when I trained with the boosting model on larger number of samples and I couldn't get multi variable logistic regression to work, both would have been good candidates to explore learning curves on over a larger range. 
+
+From the training times from the random forest learning curve we find that it fits a curved line of minutes to_ train model is proportional to number of training samples to the power of 1.5.
+
+```{r estimate_training_samples}
+temp1 <- filter(compare_models_df, model_name =="rf")
+temp2 <- temp1[2:5,c(2,5)]
+temp3 <- as.data.frame(sapply(temp2, function(x) x/min(x)))
+temp3$oneandhalf <- temp3[,1]^1.5
+temp3
+```
+
+The estimate number of samples trained in 6 hours (360 minutes) can be calculated:
+
+```{r}
+(360/39)^(2/3) * 1179  
+```
+
+So, we try to train a model with 5000 samples overnight tonight :)
+
+## Random Forest Final model
+
+The final model was trained using the code available in appendix 1.6.
+
+```{r final model specs}
+filter(compare_models_df, model_name =="rf_final")
+```
+
+The model indeed took about 6 hours (371 minutes) to train. It has increased the cross validation accuracy to 97.8% and still fits the training data 100%. Hence, with more processing time the cross validation error could most likely be further reduced.
+
+For the purpose of this assignment I will choose not to continue and be satisfied with the random forest model.
+
+Because we used cross validation to plot learning curves of various models, but not specifically to optimise the random forest model itself I expect that the out of sample error will be very similar to the cross validation error. That means that out of 20 test samples we expect to get 19 or 20 correct. 
+
+# Appendix
+
+## 1.1 Plot histograms
+
+```{r plot_hist_remainder, eval=FALSE}
+data_hist(c(11:14))
+data_hist(c(15:18))
+data_hist(c(19:22))
+data_hist(c(23:26))
+data_hist(c(27:30))
+data_hist(c(31:34))
+data_hist(c(35:38))
+data_hist(c(39:42))
+data_hist(c(43:46))
+data_hist(c(47:50))
+data_hist(c(51:54))
+data_hist(c(55:58))
+```
+
+## 1.2 Learning curve random forest
+
+```{r learning_curve_rf, eval=FALSE}
+
+steps = 5
+  
+# Training and cross validation error
+TE_rf <- seq(0, 0, length = steps)
+CVE_rf <- seq(0, 0, length = steps)
+num_sample_rf <- seq(0, 0, length = steps)
+
+clock_start_rf <- seq(0, 0, length = steps)
+clock_end_rf <- seq(0, 0, length = steps)
+  
+for(i in 1:steps){
+  # Subset a sample to train with
+  part <- 0.03 * i
+  inTrain <- createDataPartition(y=train$classe, p=part, list=FALSE)
+  rf_lc_tr <- train[inTrain,]
+  rf_lc_cv <- train[-inTrain,]
+  
+  clock_start_rf[i] <- Sys.time()
+  
+  # Train model
+  rf_lc_ml <- train(classe~ ., data=rf_lc_tr, method="rf", prox=TRUE)
+  
+  clock_end_rf[i] <- Sys.time()
+
+  # Training and cross validation predictions
+  rf_lc_tr_pred <- predict(rf_lc_ml, rf_lc_tr)
+  rf_lc_cv_pred <- predict(rf_lc_ml, rf_lc_cv) 
+  
+  # Confusion matrices for training and cross validation
+  rf_lc_tr_cm <- table(rf_lc_tr_pred, rf_lc_tr$classe)
+  rf_lc_cv_cm <- table(rf_lc_cv_pred, rf_lc_cv$classe)
+  
+  # Accuracy 
+  TE_rf[i] <- sum(diag(rf_lc_tr_cm))/sum(rf_lc_tr_cm)
+  CVE_rf[i] <- sum(diag(rf_lc_cv_cm))/sum(rf_lc_cv_cm)   
+  
+  # Update num_sample sequel for plotting
+  num_sample_rf[i] <- dim(rf_lc_tr)[1]
+  
+  # store session due to R session unexpected breakdowns.
+  save.image("D:/Data Science/Online University/Data Science Specialisation John Hopkins/08 Practical Machine Learning/Final project/.RData")
+}
+  
+lcT <- data.frame(Samples = num_sample_rf, Error = TE_rf)
+lcCV <- data.frame(Samples = num_sample_rf, Error = CVE_rf)
+  
+g <- ggplot(NULL, aes(y=Error, x=Samples))
+g <- g + geom_line(data = lcT, colour = "cyan", size = 2)
+g <- g + geom_line(data = lcCV, colour = "yellow", size = 2)
+g <- g + ggtitle("Trainging error (cyan) and cross validation error (yellow)")
+g
+```
+
+
+## 1.3 Learning curve for random forest model with PCA
+
+```{r learning_curve_PCA, eval=FALSE}
+steps = 5
+
+# Training and cross validation error
+TE_PCA <- seq(0, 0, length = steps)
+CVE_PCA <- seq(0, 0, length = steps)
+num_sample_PCA <- seq(0, 0, length = steps)
+clock <- seq(0, 0, length = steps+1)
+clock[1] <-Sys.time()
+
+for(i in 1:steps){
+    # Subset a sample to train with
+    part <- 0.05 * i
+    inTrain <- createDataPartition(y=train_PCA$classe, p=part, list=FALSE)
+    rf_lc_tr <- train_PCA[inTrain,]
+    rf_lc_cv <- train_PCA[-inTrain,]
+    
+    # Train model
+    rf_lc_ml <- train(classe~ ., data=rf_lc_tr, method="rf", prox=TRUE)
+    
+    clock[i+1] <-Sys.time()
+    
+    # Training and cross validation predictions
+    rf_lc_tr_pred <- predict(rf_lc_ml, rf_lc_tr)
+    rf_lc_cv_pred <- predict(rf_lc_ml, rf_lc_cv) 
+    
+    # Confusion matrices for training and cross validation
+    rf_lc_tr_cm <- table(rf_lc_tr_pred, rf_lc_tr$classe)
+    rf_lc_cv_cm <- table(rf_lc_cv_pred, rf_lc_cv$classe)
+    
+    # Accuracy 
+    TE_PCA[i] <- sum(diag(rf_lc_tr_cm))/sum(rf_lc_tr_cm)
+    CVE_PCA[i] <- sum(diag(rf_lc_cv_cm))/sum(rf_lc_cv_cm)   
+    
+    # Update num_sample sequel for plotting
+    num_sample_PCA[i] <- dim(rf_lc_tr)[1]
+}
+
+lcT <- data.frame(Samples = num_sample_PCA, Error = TE_PCA)
+lcCV <- data.frame(Samples = num_sample_PCA, Error = CVE_PCA)
+
+g <- ggplot(NULL, aes(y=Error, x=Samples))
+g <- g + geom_line(data = lcT, colour = "cyan", size = 2)
+g <- g + geom_line(data = lcCV, colour = "yellow", size = 2)
+g <- g + ggtitle("Trainging error (cyan) and cross validation error (yellow)")
+g
+```
+
+## 1.4 Learning curve for boosting
+
+```{r learning_curve_boosting, eval=FALSE}
+steps = 2
+
+# Training and cross validation error
+TE_b <- seq(0, 0, length = steps)
+CVE_b <- seq(0, 0, length = steps)
+num_sample_b <- seq(0, 0, length = steps)
+clock_start_b <- seq(0, 0, length = steps)
+clock_end_b <- seq(0, 0, length = steps)
+
+clock_b <- seq(0, 0, length = steps+1)
+clock_b[1] <-Sys.time()
+
+for(i in 1:steps){
+    # Subset a sample to train with
+    part <- 0.055 * i
+    inTrain <- createDataPartition(y=train$classe, p=part, list=FALSE)
+    b_lc_tr <- train[inTrain,]
+    b_lc_cv <- train[-inTrain,]
+    
+    clock_start_b[i] <- Sys.time()
+    
+    # Train model
+    b_lc_ml <- train(classe~ ., data=b_lc_tr, method="gbm", verbose=FALSE)
+    
+    clock_end_b[i] <- Sys.time()
+    
+    # Training and cross validation predictions
+    b_lc_tr_pred <- predict(b_lc_ml, b_lc_tr)
+    b_lc_cv_pred <- predict(b_lc_ml, b_lc_cv) 
+    
+    # Confusion matrices for training and cross validation
+    b_lc_tr_cm <- table(b_lc_tr_pred, b_lc_tr$classe)
+    b_lc_cv_cm <- table(b_lc_cv_pred, b_lc_cv$classe)
+    
+    # Accuracy 
+    TE_b[i] <- sum(diag(b_lc_tr_cm))/sum(b_lc_tr_cm)
+    CVE_b[i] <- sum(diag(b_lc_cv_cm))/sum(b_lc_cv_cm)   
+    
+    # Update num_sample sequel for plotting
+    num_sample_b[i] <- dim(b_lc_tr)[1]
+    
+    # store session
+    save.image("D:/Data Science/Online University/Data Science Specialisation John Hopkins/08 Practical Machine Learning/Final project/.RData")
+}
+
+lcT <- data.frame(Samples = num_sample_b, Error = TE_b)
+lcCV <- data.frame(Samples = num_sample_b, Error = CVE_b)
+
+g <- ggplot(NULL, aes(y=Error, x=Samples))
+g <- g + geom_line(data = lcT, colour = "cyan", size = 2)
+g <- g + geom_line(data = lcCV, colour = "yellow", size = 2)
+g <- g + ggtitle("Trainging error (cyan) and cross validation error (yellow)")
+g
+```
+
+## 1.5 Learning curve with tree
+
+```{r learning_curve_tree, eval=FALSE}
+steps = 18
+
+# Training and cross validation error
+TE_tree <- seq(0, 0, length = steps)
+CVE_tree <- seq(0, 0, length = steps)
+num_sample_tree <- seq(0, 0, length = steps)
+clock_start_tree <- seq(0, 0, length = steps)
+clock_end_tree <- seq(0, 0, length = steps)
+
+clock_tree <- seq(0, 0, length = steps+1)
+clock_tree[1] <- Sys.time()
+
+for(i in 1:steps){
+    # Subset a sample to train with
+    part <- 0.05 * i
+    inTrain <- createDataPartition(y=train$classe, p=part, list=FALSE)
+    tree_lc_tr <- train[inTrain,]
+    tree_lc_cv <- train[-inTrain,]
+    
+    clock_start_tree[i] <- Sys.time()
+    
+    # Train model
+    tree_lc_ml <- train(classe~ ., data=tree_lc_tr, method="rpart")
+    
+    clock_end_tree[i] <- Sys.time()
+    
+    # Training and cross validation predictions
+    tree_lc_tr_pred <- predict(tree_lc_ml, tree_lc_tr)
+    tree_lc_cv_pred <- predict(tree_lc_ml, tree_lc_cv) 
+    
+    # Confusion matrices for training and cross validation
+    tree_lc_tr_cm <- table(tree_lc_tr_pred, tree_lc_tr$classe)
+    tree_lc_cv_cm <- table(tree_lc_cv_pred, tree_lc_cv$classe)
+    
+    # Accuracy 
+    TE_tree[i] <- sum(diag(tree_lc_tr_cm))/sum(tree_lc_tr_cm)
+    CVE_tree[i] <- sum(diag(tree_lc_cv_cm))/sum(tree_lc_cv_cm)   
+    
+    # Update num_sample sequel for plotting
+    num_sample_tree[i] <- dim(tree_lc_tr)[1]
+}
+
+lcT <- data.frame(Samples = num_sample_tree, Error = TE_tree)
+lcCV <- data.frame(Samples = num_sample_tree, Error = CVE_tree)
+
+g <- ggplot(NULL, aes(y=Error, x=Samples))
+g <- g + geom_line(data = lcT, colour = "cyan", size = 2)
+g <- g + geom_line(data = lcCV, colour = "yellow", size = 2)
+g <- g + ggtitle("Trainging error (cyan) and cross validation error (yellow)")
+g
+```
+
+## 1.6 Final RF model code
+
+```{r final rf model, eval =FALSE}
+  part <- 0.25
+  inTrain <- createDataPartition(y=train$classe, p=part, list=FALSE)
+  rf_tr <- train[inTrain,]
+  rf_cv <- train[-inTrain,]
+  
+  clock_start_rf_final <- Sys.time()
+  
+  # Train model
+  rf_ml <- train(classe~ ., data=rf_tr, method="rf", prox=TRUE)
+  # store session
+
+  clock_end_rf_final <- Sys.time()
+  
+  save.image("D:/Data Science/Online University/Data Science Specialisation John Hopkins/08 Practical Machine Learning/Final project/.RData")
+  
+  # Training and cross validation predictions
+  rf_tr_pred <- predict(rf_ml, rf_tr)
+  rf_cv_pred <- predict(rf_ml, rf_cv) 
+  
+  # Confusion matrices for training and cross validation
+  rf_tr_cm <- table(rf_tr_pred, rf_tr$classe)
+  rf_cv_cm <- table(rf_cv_pred, rf_cv$classe)
+  
+  # Accuracy 
+  TE_rf_final <- sum(diag(rf_tr_cm))/sum(rf_tr_cm)
+  CVE_rf_final <- sum(diag(rf_cv_cm))/sum(rf_cv_cm)   
+  
+  # Update num_sample sequel for plotting
+  num_sample_rf_final <- dim(rf_tr)[1]
+
+  # store session
+  save.image("D:/Data Science/Online University/Data Science Specialisation John Hopkins/08 Practical Machine Learning/Final project/.RData")
+```

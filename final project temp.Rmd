@@ -1,0 +1,17 @@
+---
+title: "temps"
+author: "Jiddu Alexander"
+date: "March 12, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, fig.height=3.5, echo=FALSE, warning=FALSE, message=FALSE, results="show")
+options(scipen=999)
+```
+
+```{r}
+library(caret)
+```
+
+
